@@ -82,9 +82,11 @@ def load_environment(
     explanation_metrics: list[str] | str | None = None,  # None/"all" => average of all four
     # Optional judge settings
     use_judge: bool = False,
+    judge_mode: str | None = None,  # "g-eval" | "factscore"
     judge_model: str = "gpt-4o-mini",
     judge_base_url: str | None = None,
     judge_api_key: str | None = None,
+    use_coverage: bool = False,  # For FactScore: enable coverage calculation (slower but comprehensive)
     **kwargs
 ) -> vf.Environment:
     """
@@ -284,71 +286,24 @@ def load_environment(
     if use_explanations and use_judge:
         api_key = judge_api_key if judge_api_key else os.getenv("JUDGE_API_KEY") or os.getenv("OPENAI_API_KEY")
         judge_client = AsyncOpenAI(base_url=judge_base_url, api_key=api_key) if api_key else None
-        judge_rubric = vf.JudgeRubric(
-            judge_client=judge_client,
-            judge_model=judge_model,
-            judge_prompt="{question}",
-        )
+        if judge_mode is None:
+            raise ValueError("use_judge=True requires judge_mode to be one of {'g-eval','factscore'}")
+        if judge_mode not in ("g-eval", "factscore"):
+            raise ValueError("judge_mode must be 'g-eval' or 'factscore'")
 
-        async def explanation_judge_reward(judge, prompt, completion, answer, state, **kwargs) -> float:
-            completion_text = _get_completion_text(completion)
-            info = kwargs.get("info", {}) or {}
-            options = {"A": info.get("A", ""), "B": info.get("B", ""), "C": info.get("C", ""), "D": info.get("D", "")}
-            gold = (answer or "").strip().upper()
-            pred_letter = extract_answer_letter(completion_text, options)
-            if pred_letter != gold:
-                base = 0.0
-            else:
-                # Build judge prompt
-                question = info.get("question", "")
-                opts_str = "\n".join(f"{k}. {options.get(k, '')}" for k in ["A","B","C","D"]) 
-                formatted_question = f"{question}\n{opts_str}"
-                exp0 = info.get("exp0", "")
-                exp1 = info.get("exp1", "")
-                full_prompt = (
-                    "You are evaluating the quality of a medical explanation.\n\n"
-                    "**Question:**\n" + formatted_question + "\n\n"
-                    "**Correct Answer:** " + str(answer) + "\n\n"
-                    "**Reference Explanation 1:**\n" + str(exp0) + "\n\n"
-                    "**Reference Explanation 2:**\n" + str(exp1) + "\n\n"
-                    "**Model's Response:**\n" + completion_text + "\n\n"
-                    "Evaluate whether the model's explanation is medically accurate, relevant, and demonstrates understanding of the medical concepts. The explanation should justify why the answer is correct.\n\n"
-                    "Compare the model's explanation quality to the reference explanations. Consider:\n"
-                    "- Medical accuracy\n"
-                    "- Relevance to the question\n"
-                    "- Clarity and completeness\n"
-                    "- Proper use of medical concepts\n\n"
-                    "Respond with a score from 0.0 to 1.0:\n"
-                    "- 1.0 = Excellent (as good as or better than references)\n"
-                    "- 0.75 = Good (mostly correct with minor issues)\n"
-                    "- 0.5 = Acceptable (partially correct)\n"
-                    "- 0.25 = Poor (significant errors)\n"
-                    "- 0.0 = Wrong or irrelevant\n\n"
-                    "Respond with ONLY a number between 0.0 and 1.0."
-                )
-                judge_response = await judge_rubric.judge(
-                    [{"role": "user", "content": full_prompt}],
-                    "",
-                    "",
-                    state,
-                    **kwargs,
-                )
-                try:
-                    score_str = str(judge_response).strip()
-                    import re as _re
-                    number_match = _re.search(r"(\d+\.?\d*)", score_str)
-                    explanation_score = float(number_match.group(1)) if number_match else 0.0
-                except Exception:
-                    explanation_score = 0.0
-                base = max(0.0, min(1.0, explanation_score)) * 100.0
-            return base
-
-        # Use JudgeRubric with two metrics: answer accuracy (sync), explanation judge (async)
-        judge_rubric.add_reward_func(answer_accuracy_reward, weight=mcq_weight)
-        judge_rubric.add_reward_func(explanation_judge_reward, weight=explanation_weight)
-        rubric = judge_rubric
+        if judge_mode == "g-eval":
+            from .geval_judge.geval_judge import create_geval_judge_rubric
+            judge_rubric = create_geval_judge_rubric(parser=parser, judge_client=judge_client, judge_model=judge_model)
+            # Combine answer accuracy with the judge-based explanation score
+            judge_rubric.add_reward_func(answer_accuracy_reward, weight=mcq_weight)
+            rubric = judge_rubric
+        elif judge_mode == "factscore":
+            from .factscore_judge.atomic_facts_judge import create_factscore_judge_rubric
+            judge_rubric = create_factscore_judge_rubric(parser=parser, judge_client=judge_client, judge_model=judge_model, use_coverage=use_coverage)
+            judge_rubric.add_reward_func(answer_accuracy_reward, weight=mcq_weight)
+            rubric = judge_rubric
     else:
-        # Keep metrics separate (and a combine drewad with tunable weights)
+        # Keep metrics separate (and a combined reward with tunable weights)
         rubric = vf.Rubric(funcs=[answer_accuracy_reward, explanation_reward], weights=[mcq_weight, explanation_weight], parser=parser)
 
     env = vf.SingleTurnEnv(

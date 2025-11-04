@@ -6,8 +6,10 @@ from datasets import Dataset, concatenate_datasets
 from verifiers.utils.data_utils import THINK_BOXED_SYSTEM_PROMPT, extract_boxed_answer
 import pandas as pd
 import evaluate
-from thefuzz import process
 from openai import AsyncOpenAI
+
+from medarc_verifiers.rewards.multiple_choice_accuracy import multiple_choice_accuracy
+from medarc_verifiers.utils.randomize_multiple_choice import randomize_multiple_choice
 
 
 # MedExQA specialties
@@ -35,13 +37,13 @@ def _build_question_str(question: str, options: dict[str, str]) -> str:
     return f"{instruction}{question}\n{opts}\nAnswer:"
 
 
-def _to_vf_format(ds: Dataset) -> Dataset:
+def _to_vf_format(ds: Dataset, shuffle_answers: bool, shuffle_seed: int | None) -> Dataset:
     """Normalize raw rows into the fields expected by SingleTurnEnv.
 
     Produces rows of the form:
       - question: string containing authors' instruction, question, and options
-      - answer: gold letter (A/B/C/D)
-      - info: original fields including exp0/exp1 and specialty
+      - answer: gold letter (A/B/C/D) - shuffled if shuffle_answers=True
+      - info: original fields including exp0/exp1 and specialty, plus shuffled options
     """
     def _format_row(row: dict) -> dict:
         question = row.get("question", "") or ""
@@ -59,10 +61,27 @@ def _to_vf_format(ds: Dataset) -> Dataset:
         if answer_letter not in ("A", "B", "C", "D"):
             return None
 
+        # Shuffle options if requested
+        if shuffle_answers:
+            opts, answer_letter, _ = randomize_multiple_choice(
+                options=opts,
+                answer_choice=answer_letter,
+                seed=shuffle_seed,
+                row_id=question,  # Use question text for deterministic per-row shuffling
+            )
+
         question_str = _build_question_str(question, opts)
 
         # Keep original data in info
         info = dict(row)
+
+        # Update info with shuffled values
+        if shuffle_answers:
+            info["A"] = opts["A"]
+            info["B"] = opts["B"]
+            info["C"] = opts["C"]
+            info["D"] = opts["D"]
+            info["answer"] = answer_letter
 
         return {
             "question": question_str,
@@ -70,7 +89,13 @@ def _to_vf_format(ds: Dataset) -> Dataset:
             "info": info,
         }
 
-    return ds.map(_format_row, remove_columns=ds.column_names).filter(lambda row: row is not None)
+    # Disable cache when shuffling to ensure fresh randomization
+    load_from_cache_file = not shuffle_answers
+    return ds.map(
+        _format_row,
+        remove_columns=ds.column_names,
+        load_from_cache_file=load_from_cache_file
+    ).filter(lambda row: row is not None, load_from_cache_file=load_from_cache_file)
 
 
 def load_environment(
@@ -80,6 +105,9 @@ def load_environment(
     explanation_weight: float = 0.5,
     specialty: list[str] | str | None = None,  # list of short codes or full names; None/"ALL" => all
     explanation_metrics: list[str] | str | None = None,  # None/"all" => average of all four
+    # MCQ shuffling
+    shuffle_answers: bool = False,
+    shuffle_seed: int | None = 1618,
     # Optional judge settings
     use_judge: bool = False,
     judge_mode: str | None = None,  # "g-eval" | "factscore"
@@ -150,7 +178,7 @@ def load_environment(
 
     # Concatenate and format for verifiers - no training dataset available
     test_combined = concatenate_datasets(test_datasets) if test_datasets else None
-    test_ds = _to_vf_format(test_combined) if test_combined else None
+    test_ds = _to_vf_format(test_combined, shuffle_answers, shuffle_seed) if test_combined else None
 
     # Shuffle examples if multiple specialties were selected
     if macro_active and test_ds is not None:
@@ -174,32 +202,6 @@ def load_environment(
         return 1.0 if response == answer else 0.0
 
     # (shuffling handled above when multiple specialties)
-
-    # Helpers (authors' answer extraction logic)
-    def process_before_extraction(gen: str, choice_dict: dict[str, str]) -> str:
-        for key, val in sorted(choice_dict.items(), key=lambda x: len(x[1] or ""), reverse=True):
-            pattern = re.compile(re.escape((val or "").rstrip(".")), re.IGNORECASE)
-            gen = pattern.sub(key, gen)
-        return gen
-
-    def extract_choice(gen: str, choice_list: list[str]) -> str:
-        res = re.search(r"(?:(?:[Cc]hoose)|(?:(?:[Aa]nswer|[Cc]hoice)(?![^ABCD]{0,20}?(?:n't|not))[^ABCD]{0,10}?\b(?:|is|:|be))\b)[^ABCD]{0,20}?\b(A|B|C|D)\b", gen)
-        if res is None:
-            res = re.search(r"\b(A|B|C|D)\b(?![^ABCD]{0,8}?(?:n't|not)[^ABCD]{0,5}?(?:correct|right))[^ABCD]{0,10}?\b(?:correct|right)\b", gen)
-        if res is None:
-            res = re.search(r"^(A|B|C|D)(?:\.|,|:|$)", gen)
-        if res is None:
-            res = re.search(r"(?<![a-zA-Z])(A|B|C|D)(?![a-zA-Z=])", gen)
-        if res is None:
-            best = process.extractOne(gen, choice_list)
-            choices = ["A", "B", "C", "D"]
-            return choices[choice_list.index(best[0])] if best else ""
-        return res.group(1)
-
-    def extract_answer_letter(completion_text: str, options: dict[str, str]) -> str:
-        gen = process_before_extraction(completion_text or "", options)
-        pred = extract_choice(gen, [options.get(c, "") for c in ["A", "B", "C", "D"]])
-        return (pred or "").upper()
 
     # Lexical Metrics selection; pass individually or None/'all'/'overall' => average of all four
     base_metrics = ["rougeL", "bleu", "meteor", "bertscore"]
@@ -264,23 +266,41 @@ def load_environment(
     def answer_accuracy_reward(parser, completion, answer, **kwargs) -> float:
         completion_text = _get_completion_text(completion)
         info = kwargs.get("info", {}) or {}
+
+        # Get answer_text for fallback matching
         options = {"A": info.get("A", ""), "B": info.get("B", ""), "C": info.get("C", ""), "D": info.get("D", "")}
-        gold = (answer or "").strip().upper()
-        pred_letter = extract_answer_letter(completion_text, options)
-        base = 100.0 if pred_letter == gold else 0.0
-        return base
+        answer_text = options.get(answer, "")
+
+        is_correct = multiple_choice_accuracy(
+            llm_answer=completion_text,
+            answer_letter=answer,
+            answer_text=answer_text,
+            accept_answer_text=True,
+            strip_tex=False,  # MedExQA doesn't use LaTeX
+        )
+        return 100.0 if is_correct else 0.0
 
     def explanation_reward(parser, completion, answer, **kwargs) -> float:
         completion_text = _get_completion_text(completion)
         info = kwargs.get("info", {}) or {}
+
+        # Get answer_text for fallback matching
         options = {"A": info.get("A", ""), "B": info.get("B", ""), "C": info.get("C", ""), "D": info.get("D", "")}
-        gold = (answer or "").strip().upper()
-        pred_letter = extract_answer_letter(completion_text, options)
-        if pred_letter != gold:
-            base = 0.0
+        answer_text = options.get(answer, "")
+
+        # Check if answer is correct using multiple_choice_accuracy
+        is_correct = multiple_choice_accuracy(
+            llm_answer=completion_text,
+            answer_letter=answer,
+            answer_text=answer_text,
+            accept_answer_text=True,
+            strip_tex=False,
+        )
+
+        if not is_correct:
+            return 0.0
         else:
-            base = compute_expl_score(completion_text, info.get("exp0", ""), info.get("exp1", ""))
-        return base
+            return compute_expl_score(completion_text, info.get("exp0", ""), info.get("exp1", ""))
 
     # Optional: Use LLM-as-judge for explanation instead of lexical metrics
     if use_explanations and use_judge:
@@ -303,8 +323,16 @@ def load_environment(
             judge_rubric.add_reward_func(answer_accuracy_reward, weight=mcq_weight)
             rubric = judge_rubric
     else:
-        # Keep metrics separate (and a combined reward with tunable weights)
-        rubric = vf.Rubric(funcs=[answer_accuracy_reward, explanation_reward], weights=[mcq_weight, explanation_weight], parser=parser)
+        # Lexical metrics for explanations (or MCQ-only if use_explanations=False)
+        if use_explanations:
+            rubric = vf.Rubric(
+                funcs=[answer_accuracy_reward, explanation_reward],
+                weights=[mcq_weight, explanation_weight],
+                parser=parser
+            )
+        else:
+            # MCQ-only mode
+            rubric = vf.Rubric(funcs=[answer_accuracy_reward], weights=[1.0], parser=parser)
 
     env = vf.SingleTurnEnv(
         dataset=None,  # No training split available

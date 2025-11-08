@@ -17,22 +17,26 @@ class AtomicFactGenerator:
         self.client = async_openai_client
         self.model_name = model_name
 
-    async def run(self, explanation_text: str) -> List[str]:
+    async def run(self, explanation_text: str, state: dict = None) -> List[str]:
         """
         Extract atomic facts from an MCQA explanation.
+        
+        Args:
+            explanation_text: The explanation text to extract claims from
+            state: Optional state dict for token tracking
         """
         explanation = (explanation_text or "").strip()
         if not explanation:
             return []
 
-        primary = await self._extract_json_claims(explanation)
+        primary = await self._extract_json_claims(explanation, state=state)
         if primary:
             return primary
 
-        fallback = await self._extract_json_claims(explanation, fallback=True)
+        fallback = await self._extract_json_claims(explanation, fallback=True, state=state)
         return fallback or []
 
-    async def _extract_json_claims(self, explanation: str, fallback: bool = False) -> List[str]:
+    async def _extract_json_claims(self, explanation: str, fallback: bool = False, state: dict = None) -> List[str]:
         if self.client is None:
             return []
 

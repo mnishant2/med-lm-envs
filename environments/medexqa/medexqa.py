@@ -312,13 +312,13 @@ def load_environment(
             raise ValueError("judge_mode must be 'g-eval' or 'factscore'")
 
         if judge_mode == "g-eval":
-            from .geval_judge.geval_judge import create_geval_judge_rubric
+            from environments.medexqa.geval_judge.geval_judge import create_geval_judge_rubric
             judge_rubric = create_geval_judge_rubric(parser=parser, judge_client=judge_client, judge_model=judge_model)
             # Combine answer accuracy with the judge-based explanation score
             judge_rubric.add_reward_func(answer_accuracy_reward, weight=mcq_weight)
             rubric = judge_rubric
         elif judge_mode == "factscore":
-            from .factscore_judge.atomic_facts_judge import create_factscore_judge_rubric
+            from environments.medexqa.factscore_judge.atomic_facts_judge import create_factscore_judge_rubric
             judge_rubric = create_factscore_judge_rubric(parser=parser, judge_client=judge_client, judge_model=judge_model, use_coverage=use_coverage)
             judge_rubric.add_reward_func(answer_accuracy_reward, weight=mcq_weight)
             rubric = judge_rubric

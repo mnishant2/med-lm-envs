@@ -16,15 +16,7 @@ from .atomic_facts_generator import AtomicFactGenerator
 
 JUDGE_TEMPLATE = """You are a medical knowledge verification expert. Evaluate if the Passage supports the Claim.
 
-CONTEXT:
-Question: {question}
-Correct Answer: ({correct_letter}) {correct_option}
-
-Reference Explanations:
-- Reference 1: {exp0}
-- Reference 2: {exp1}
-
-PASSAGE (Combined References):
+PASSAGE:
 {response}
 
 CLAIM TO VERIFY:
@@ -122,7 +114,7 @@ async def explanation_factscore_reward(
         if llm_client is None:
             # No client available - cannot extract claims
             return 0.0
-        claims = await generator.run(explanation)
+        claims = await generator.run(explanation, state=state)
     except Exception as e:
         # Log extraction error for debugging
         import sys
@@ -138,18 +130,9 @@ async def explanation_factscore_reward(
 
     for claim in claims:
         total += 1
-        prompt_msg = JUDGE_TEMPLATE.format(
-            response=refs,
-            answer=str(claim),
-            question=question,
-            correct_letter=correct_letter,
-            correct_option=correct_option_text,
-            exp0=exp0,
-            exp1=exp1
-        )
-        judge_response = await judge([
-            {"role": "user", "content": prompt_msg}
-        ], "", "", state, **kwargs)
+        # Call judge like medredqa does: judge(prompt, completion, answer, state, **kwargs)
+        # prompt is not used in template, completion becomes {response}, answer becomes {answer}
+        judge_response = await judge(prompt, refs, str(claim), state, **kwargs)
         score, ok = extract_support_level(judge_response)
         if ok:
             support_score += score
@@ -169,7 +152,7 @@ async def explanation_factscore_reward(
         # Extract from reference 1
         if (exp0 or "").strip():
             try:
-                ref0_claims = await generator.run(exp0)
+                ref0_claims = await generator.run(exp0, state=state)
                 all_ref_claims.extend(ref0_claims)
             except Exception:
                 pass
@@ -177,7 +160,7 @@ async def explanation_factscore_reward(
         # Extract from reference 2
         if (exp1 or "").strip():
             try:
-                ref1_claims = await generator.run(exp1)
+                ref1_claims = await generator.run(exp1, state=state)
                 all_ref_claims.extend(ref1_claims)
             except Exception:
                 pass
@@ -197,18 +180,8 @@ async def explanation_factscore_reward(
         for ref_claim in unique_ref_claims:
             coverage_total += 1
             # Check if model explanation supports this reference claim
-            prompt_msg = JUDGE_TEMPLATE.format(
-                response=explanation,  # Passage = model explanation
-                answer=str(ref_claim),  # Claim = reference claim
-                question=question,
-                correct_letter=correct_letter,
-                correct_option=correct_option_text,
-                exp0=exp0,
-                exp1=exp1
-            )
-            cov_response = await judge([
-                {"role": "user", "content": prompt_msg}
-            ], "", "", state, **kwargs)
+            # Call judge: passage=explanation, claim=ref_claim
+            cov_response = await judge(prompt, explanation, str(ref_claim), state, **kwargs)
             score, ok = extract_support_level(cov_response)
             if ok:
                 coverage_score += score
@@ -246,6 +219,7 @@ def create_factscore_judge_rubric(
     judge_model: str = "gpt-4o-mini",
     use_coverage: bool = False,
 ) -> vf.JudgeRubric:
+    # Pass judge_prompt like medredqa does - uses standard {response} and {answer} placeholders
     rubric = vf.JudgeRubric(
         judge_client=judge_client,
         judge_model=judge_model,

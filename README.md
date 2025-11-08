@@ -196,4 +196,5 @@ export MEDARC_DISABLE_TOKEN_TRACKING=true
 - Tokens extracted from API `response.usage` field
 - If provider doesn't return usage data, defaults to 0
 - Model tokens include all inference API calls
-- Judge tokens include all LLM-as-judge calls (e.g., FactScore: 6-20 calls per example)
+- Judge tokens include all LLM-as-judge calls via `judge()` method (e.g., FactScore: 6-20 verification calls per example)
+- **Note**: Some judge implementations (e.g., FactScore claim extraction) make additional API calls (claim extraction) that are currently not tracked not part of judge() calls or get stored in state["responses"]. These represent a small overhead (~10-20% of total judge tokens) and are present in existing implementations like MedRedQA, keep in mind when calculating.

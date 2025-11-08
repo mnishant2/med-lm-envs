@@ -137,12 +137,25 @@ async def explanation_geval_reward(
     correct_letter = (answer or "").strip().upper()
 
     # Gate explanation to zero if predicted MCQ answer is wrong
-    try:
-        m = re.search(r"(?<![A-Z])\b(A|B|C|D)\b", completion_text)
-        pred_letter = (m.group(1) if m else "").strip().upper()
-    except Exception:
-        pred_letter = ""
-    if correct_letter != pred_letter:
+    # Parse answer first (extracts from \boxed{} in think mode, returns raw text in normal mode)
+    parser = kwargs.get("parser")
+    if parser:
+        parsed = parser.parse_answer(completion) or ""
+    else:
+        parsed = completion_text
+
+    from medarc_verifiers.rewards.multiple_choice_accuracy import multiple_choice_accuracy
+
+    correct_option_text = options.get(correct_letter, "")
+    is_correct = multiple_choice_accuracy(
+        llm_answer=parsed,
+        answer_letter=correct_letter,
+        answer_text=correct_option_text,
+        accept_answer_text=True,
+        strip_tex=False,
+    )
+
+    if not is_correct:
         return 0.0
 
     # Format options string
@@ -187,6 +200,7 @@ def create_geval_judge_rubric(
     parser: vf.Parser,
     judge_client,
     judge_model: str = "gpt-4o-mini",
+    explanation_weight: float = 1.0,
 ) -> vf.JudgeRubric:
     rubric = vf.JudgeRubric(
         judge_client=judge_client,
@@ -194,7 +208,7 @@ def create_geval_judge_rubric(
         judge_prompt="{question}",  # not used directly; reward builds full prompt
         parser=parser,
     )
-    rubric.add_reward_func(explanation_geval_reward, weight=1.0)
+    rubric.add_reward_func(explanation_geval_reward, weight=explanation_weight)
     return rubric
 
 

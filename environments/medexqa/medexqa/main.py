@@ -3,7 +3,6 @@ import re
 
 import verifiers as vf
 from datasets import Dataset, concatenate_datasets
-from verifiers.utils.data_utils import THINK_BOXED_SYSTEM_PROMPT, extract_boxed_answer
 import pandas as pd
 import evaluate
 from openai import AsyncOpenAI
@@ -22,11 +21,11 @@ SPECIALTIES = [
 ]
 
 # author prompt directly taken from https://github.com/knowlab/MedExQA/blob/9a5b34af103b0c8ba0c00906e278f6572249fafa/evaluate_pipe_MedExQA.py#L32
-def _build_question_str(question: str, options: dict[str, str]) -> str:
+def _build_question_str(question: str, options: dict[str, str], use_think: bool = False) -> str:
     """Build user prompt with authors' instruction embedded (as in their script).
 
     The instruction lives in the user message; the system prompt remains empty in
-    normal mode, and only adds THINK_BOXED in think-mode.
+    normal mode. In think mode, system prompt instructs use of <think> and <answer> tags.
     """
     instruction = (
         "The following is a multiple-choice question. Please choose the most suitable one "
@@ -187,19 +186,21 @@ def load_environment(
         except Exception:
             pass
 
-    # Setup system prompt - empty for normal; use think-boxed for think mode
-    system_prompt = THINK_BOXED_SYSTEM_PROMPT if use_think else ""
-
-    # Parser for extracting \\boxed{} answers
-    parser = (
-        vf.ThinkParser(extract_fn=extract_boxed_answer) if use_think
-        else vf.Parser(extract_fn=extract_boxed_answer)
-    )
-
-    def correct_answer_reward_func(parser, completion, answer, **kwargs) -> float:
-        """Reward function for MCQ accuracy."""
-        response = parser.parse_answer(completion) or ""
-        return 1.0 if response == answer else 0.0
+    # Setup system prompt and parser - standardized with medredqa approach
+    # - Normal mode: No system prompt, parser returns raw text
+    # - Think mode: XML system prompt, XMLParser extracts from <answer> tags
+    if use_think:
+        # Like medredqa: think in <think> tags, answer+explanation in <answer> tags
+        system_prompt = (
+            "Think step-by-step inside <think>...</think> tags. "
+            "Then, inside <answer>...</answer> tags, provide your final answer choice (A, B, C, or D) "
+            "followed by an explanation of why you chose that answer."
+        )
+        parser = vf.XMLParser(fields=["think", "answer"], answer_field="answer")
+    else:
+        # Normal mode: no system prompt, parser returns raw text for multiple_choice_accuracy
+        system_prompt = ""
+        parser = vf.Parser()
 
     # (shuffling handled above when multiple specialties)
 
@@ -264,7 +265,8 @@ def load_environment(
         return completion_obj if isinstance(completion_obj, str) else str(completion_obj)
 
     def answer_accuracy_reward(parser, completion, answer, **kwargs) -> float:
-        completion_text = _get_completion_text(completion)
+        # Parse answer first (extracts from \boxed{} in think mode, returns raw text in normal mode)
+        parsed = parser.parse_answer(completion) or ""
         info = kwargs.get("info", {}) or {}
 
         # Get answer_text for fallback matching
@@ -272,7 +274,7 @@ def load_environment(
         answer_text = options.get(answer, "")
 
         is_correct = multiple_choice_accuracy(
-            llm_answer=completion_text,
+            llm_answer=parsed,
             answer_letter=answer,
             answer_text=answer_text,
             accept_answer_text=True,
@@ -281,7 +283,8 @@ def load_environment(
         return 100.0 if is_correct else 0.0
 
     def explanation_reward(parser, completion, answer, **kwargs) -> float:
-        completion_text = _get_completion_text(completion)
+        # Parse answer first (extracts from \boxed{} in think mode, returns raw text in normal mode)
+        parsed = parser.parse_answer(completion) or ""
         info = kwargs.get("info", {}) or {}
 
         # Get answer_text for fallback matching
@@ -290,7 +293,7 @@ def load_environment(
 
         # Check if answer is correct using multiple_choice_accuracy
         is_correct = multiple_choice_accuracy(
-            llm_answer=completion_text,
+            llm_answer=parsed,
             answer_letter=answer,
             answer_text=answer_text,
             accept_answer_text=True,
@@ -300,6 +303,8 @@ def load_environment(
         if not is_correct:
             return 0.0
         else:
+            # For lexical metrics, use the raw completion text (not parsed)
+            completion_text = _get_completion_text(completion)
             return compute_expl_score(completion_text, info.get("exp0", ""), info.get("exp1", ""))
 
     # Optional: Use LLM-as-judge for explanation instead of lexical metrics
@@ -312,14 +317,14 @@ def load_environment(
             raise ValueError("judge_mode must be 'g-eval' or 'factscore'")
 
         if judge_mode == "g-eval":
-            from environments.medexqa.geval_judge.geval_judge import create_geval_judge_rubric
-            judge_rubric = create_geval_judge_rubric(parser=parser, judge_client=judge_client, judge_model=judge_model)
+            from medexqa.geval_judge.geval_judge import create_geval_judge_rubric
+            judge_rubric = create_geval_judge_rubric(parser=parser, judge_client=judge_client, judge_model=judge_model, explanation_weight=explanation_weight)
             # Combine answer accuracy with the judge-based explanation score
             judge_rubric.add_reward_func(answer_accuracy_reward, weight=mcq_weight)
             rubric = judge_rubric
         elif judge_mode == "factscore":
-            from environments.medexqa.factscore_judge.atomic_facts_judge import create_factscore_judge_rubric
-            judge_rubric = create_factscore_judge_rubric(parser=parser, judge_client=judge_client, judge_model=judge_model, use_coverage=use_coverage)
+            from medexqa.factscore_judge.atomic_facts_judge import create_factscore_judge_rubric
+            judge_rubric = create_factscore_judge_rubric(parser=parser, judge_client=judge_client, judge_model=judge_model, use_coverage=use_coverage, explanation_weight=explanation_weight)
             judge_rubric.add_reward_func(answer_accuracy_reward, weight=mcq_weight)
             rubric = judge_rubric
     else:

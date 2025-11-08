@@ -23,7 +23,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
-include = ["medexqa.py"]
+include = ["medexqa/**"]
+packages = ["medexqa"]
 
 [tool.prime.environment]
 # lets Prime/vf-eval know where the loader lives in a flat repo

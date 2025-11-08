@@ -88,12 +88,24 @@ async def explanation_factscore_reward(
     correct_option_text = options.get(correct_letter, "")
 
     # Gate explanation to zero if predicted MCQ answer is wrong
-    try:
-        m = re.search(r"(?<![A-Z])\b(A|B|C|D)\b", explanation)
-        pred_letter = (m.group(1) if m else "").strip().upper()
-    except Exception:
-        pred_letter = ""
-    if pred_letter != correct_letter:
+    # Parse answer first (extracts from \boxed{} in think mode, returns raw text in normal mode)
+    parser = kwargs.get("parser")
+    if parser:
+        parsed = parser.parse_answer(completion) or ""
+    else:
+        parsed = explanation
+
+    from medarc_verifiers.rewards.multiple_choice_accuracy import multiple_choice_accuracy
+
+    is_correct = multiple_choice_accuracy(
+        llm_answer=parsed,
+        answer_letter=correct_letter,
+        answer_text=correct_option_text,
+        accept_answer_text=True,
+        strip_tex=False,
+    )
+
+    if not is_correct:
         return 0.0
 
     # Build references block
@@ -218,6 +230,7 @@ def create_factscore_judge_rubric(
     judge_client,
     judge_model: str = "gpt-4o-mini",
     use_coverage: bool = False,
+    explanation_weight: float = 1.0,
 ) -> vf.JudgeRubric:
     # Pass judge_prompt like medredqa does - uses standard {response} and {answer} placeholders
     rubric = vf.JudgeRubric(
@@ -227,7 +240,7 @@ def create_factscore_judge_rubric(
         parser=parser,
         use_coverage=use_coverage,  # Pass through to reward function via kwargs
     )
-    rubric.add_reward_func(explanation_factscore_reward, weight=1.0)
+    rubric.add_reward_func(explanation_factscore_reward, weight=explanation_weight)
     return rubric
 
 

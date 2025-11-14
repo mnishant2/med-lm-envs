@@ -1,6 +1,5 @@
 """
 Token tracking for OpenAI-compatible API responses.
-
 Tracks model and judge token usage separately via monkey-patching.
 Automatically enabled on import unless MEDARC_DISABLE_TOKEN_TRACKING=true.
 """
@@ -31,7 +30,6 @@ class TokenTracker:
     def track_judge_tokens(state: dict, response) -> None:
         """
         Track judge tokens from ChatCompletion response.
-
         Args:
             state: Rollout state dict
             response: ChatCompletion object (before conversion to string)
@@ -39,25 +37,17 @@ class TokenTracker:
         TokenTracker.init_tracking(state)
 
         if hasattr(response, "usage") and response.usage:
-            state[TokenTracker.STATE_KEY]["judge"]["prompt"] += (
-                response.usage.prompt_tokens
-            )
-            state[TokenTracker.STATE_KEY]["judge"]["completion"] += (
-                response.usage.completion_tokens
-            )
-            state[TokenTracker.STATE_KEY]["judge"]["total"] += (
-                response.usage.total_tokens
-            )
+            state[TokenTracker.STATE_KEY]["judge"]["prompt"] += response.usage.prompt_tokens
+            state[TokenTracker.STATE_KEY]["judge"]["completion"] += response.usage.completion_tokens
+            state[TokenTracker.STATE_KEY]["judge"]["total"] += response.usage.total_tokens
 
 
 def install_patches() -> bool:
     """
     Monkey-patch verifiers for token tracking.
-
     Patches:
     1. JudgeRubric.judge() - Track judge tokens before text extraction
     2. eval_utils.make_dataset() - Extract model + judge tokens, add to results
-
     Returns:
         bool: True on success, False on failure (with warning)
     """
@@ -69,9 +59,8 @@ def install_patches() -> bool:
 
         # ===== PATCH 1: JudgeRubric.judge() =====
         # Store original as a class attribute to ensure all instances see it
-        if not hasattr(JudgeRubric, '_original_judge_unpatched'):
+        if not hasattr(JudgeRubric, "_original_judge_unpatched"):
             JudgeRubric._original_judge_unpatched = JudgeRubric.judge
-        original_judge = JudgeRubric._original_judge_unpatched
 
         async def patched_judge(self, prompt, completion, answer, state, **kwargs):
             """Patched judge() that tracks token usage before text extraction."""
@@ -87,9 +76,7 @@ def install_patches() -> bool:
                 question = str(prompt)
 
             response_text = self.parser.parse_answer(completion)
-            judge_prompt = self.judge_prompt.format(
-                question=question, answer=answer, response=response_text
-            )
+            judge_prompt = self.judge_prompt.format(question=question, answer=answer, response=response_text)
 
             # Check cache
             cached = state.get("judge_response")
@@ -103,10 +90,7 @@ def install_patches() -> bool:
                     judge_args.pop("max_tokens")
                 else:
                     judge_args["max_completion_tokens"] = judge_args.pop("max_tokens")
-            if (
-                "max_completion_tokens" in judge_args
-                and judge_args["max_completion_tokens"] is None
-            ):
+            if "max_completion_tokens" in judge_args and judge_args["max_completion_tokens"] is None:
                 judge_args.pop("max_completion_tokens")
             judge_args = {k: v for k, v in judge_args.items() if v is not None}
 
@@ -123,9 +107,7 @@ def install_patches() -> bool:
                 TokenTracker.track_judge_tokens(state, judge_response_obj)
 
                 # Extract text (original behavior)
-                judge_response_text = str(
-                    judge_response_obj.choices[0].message.content
-                )
+                judge_response_text = str(judge_response_obj.choices[0].message.content)
             except RateLimitError as e:
                 self.logger.warning(
                     f"Rate limit exceeded when calling judge model '{self.judge_model}'. "
@@ -154,13 +136,9 @@ def install_patches() -> bool:
                     f"Model: {self.judge_model}, Error: {str(e)}"
                 ) from e
             except Exception as e:
-                self.logger.warning(
-                    f"Unexpected error when calling judge model '{self.judge_model}'. "
-                    f"Error: {str(e)}"
-                )
+                self.logger.warning(f"Unexpected error when calling judge model '{self.judge_model}'. Error: {str(e)}")
                 raise RuntimeError(
-                    f"Unexpected error when calling judge model '{self.judge_model}'. "
-                    f"Error: {str(e)}"
+                    f"Unexpected error when calling judge model '{self.judge_model}'. Error: {str(e)}"
                 ) from e
 
             # Cache and return
@@ -180,7 +158,9 @@ def install_patches() -> bool:
             """Patched make_dataset() that adds token_usage column."""
 
             try:
-                dataset = original_make_dataset(results, push_to_hf_hub, hf_hub_dataset_name, **kwargs)
+                # Upstream make_dataset currently accepts only (results, **kwargs).
+                # Do NOT pass extra positional args to preserve compatibility across versions.
+                dataset = original_make_dataset(results, **kwargs)
 
                 # Build token_usage dict for each rollout
                 token_data = []
@@ -201,15 +181,12 @@ def install_patches() -> bool:
                     # Calculate totals
                     total_tokens = {
                         "prompt": model_tokens["prompt"] + judge_tokens["prompt"],
-                        "completion": model_tokens["completion"]
-                        + judge_tokens["completion"],
+                        "completion": model_tokens["completion"] + judge_tokens["completion"],
                         "total": model_tokens["total"] + judge_tokens["total"],
                     }
 
                     # Single dict with all token data
-                    token_data.append(
-                        {"model": model_tokens, "judge": judge_tokens, "total": total_tokens}
-                    )
+                    token_data.append({"model": model_tokens, "judge": judge_tokens, "total": total_tokens})
 
                 # Add single column with dict
                 dataset = dataset.add_column("token_usage", token_data)
@@ -217,7 +194,12 @@ def install_patches() -> bool:
                 return dataset
             except Exception as e:
                 logger.error(f"Error adding token_usage column: {e}", exc_info=True)
-                return dataset
+                # Fallback to original dataset without token_usage if our augmentation fails
+                try:
+                    return original_make_dataset(results, **kwargs)
+                except Exception:
+                    # If even the original fails, re-raise to preserve upstream behavior
+                    raise
 
         eval_utils.make_dataset = patched_make_dataset
 
